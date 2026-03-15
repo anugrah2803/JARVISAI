@@ -38,21 +38,16 @@ class ChatService:
             logger.warning("Failed to load session %s from disk: %s", session_id, e)
             return False
 
-    def validate_session_id(self ,session_id: str) -> bool:
+    def get_or_create_session(self, session_id: str) -> str:
         
         if not session_id:
             new_session_id = str(uuid.uuid4())
             self.sessions[new_session_id] = []
             return new_session_id
         
-        if not session_id:
-            raise ValueError(
-                "Invalid session ID format: {session_id}. session id must not be empty,"
-                "not contain path traversal characters, and must be under 255 characters."
-            )
-        
         if session_id in self.sessions:
             return session_id
+        
         if self.load_session_from_disk(session_id):
             return session_id
         
