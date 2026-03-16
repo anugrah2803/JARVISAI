@@ -1,39 +1,63 @@
-"""
-RUN SCRIPT - Start the J.A.R.V.I.S server
-
-PURPOSE:
-Single entry point to start the backend. Run this once per user/machine;
-the server then handles all chat and realtime requests for that instance.
-
-WHAT IT DOES:
-- Imports the FastAPI app from app.main.
-- Runs it with uvicorn on host 0.0.0.0 (accept connections from any interface) and port 8000.
-- reload=True means any change to Python files will restart the server (handy for development).
-
-USAGE:
-    python run.py
-
-Then open http://localhost:8000 in the browser, or use the API from another app.
-API docs: http://localhost:8000/docs
-
-NOTE:
-Before running, set GROQ_API_KEY (and optionally TAVILY_API_KEY for realtime search) in .env.
-"""
+import subprocess
+import sys
+from pathlib import Path
 
 import uvicorn
 
 
-# ------------------------------------------------------------
-# ENTRY POINT
-# ------------------------------------------------------------
-# Only run uvicorn when this file is executed directly (python run.py),
-# not when it is imported by another module.
+def _ensure_thinking_audio():
+
+    try:
+
+        result = subprocess.run(
+            [sys.executable, "-m", "app.generate_thinking_audio"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            cwd=str(Path(__file__).parent),
+        )
+
+        if result.returncode != 0 and result.stderr:
+            print(f"[startup] Thinking audio: {result.stderr.strip()}")
+
+    except Exception as e:
+
+        print(f"[startup] Thinking audio skipped: {e}")
+
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "app.main:app",   # String path to the FastAPI app instance (module:variable)
-        host="0.0.0.0",   # Listen on all network interfaces so other devices can connect
-        port=8000,        # HTTP port; change if 8000 is already in use
-        reload=False,
-        log_level="info"       # Auto-restart when .py files change (useful during development)
-    )
+
+    _ensure_thinking_audio()
+
+    try:
+
+        uvicorn.run(
+            "app.main:app",
+            host="0.0.0.0",
+            port=8000,
+            reload=True,
+        )
+
+    except OSError as e:
+
+        if "address already in use" in str(e).lower() or "10048" in str(e):
+
+            print(
+                "[ERROR] Port 8000 is already in use. "
+                "Try another port or stop the other process."
+            )
+
+        else:
+
+            print(f"[ERROR] Server failed to start: {e}")
+
+        sys.exit(1)
+
+    except KeyboardInterrupt:
+
+        print("\n[INFO] Server stopped by user.")
+
+    except Exception as e:
+
+        print(f"[ERROR] Unexpected error: {e}")
+        sys.exit(1)
