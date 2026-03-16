@@ -23,11 +23,6 @@ logger = logging.getLogger("J.A.R.V.I.S")
 
 class VectorStoreService:
 
-    """
-    Builds a FAISS index from learning_data .txt files and chats_data .json files,
-    and provides a retriever to fetch the k most relevant chunks for a query.
-    """
-
     def __init__(self):
 
         self.embeddings = HuggingFaceEmbeddings(
@@ -42,21 +37,22 @@ class VectorStoreService:
 
         self.vector_store: Optional[FAISS] = None
 
-
-    # ---------------------------------------------------------
-    # LOAD DOCUMENTS FROM DISK
-    # ---------------------------------------------------------
+        self._retriever_cache: dict = {}
 
     def load_learning_data(self) -> List[Document]:
 
         documents = []
 
-        for file_path in list(LEARNING_DATA_DIR.glob("*.txt")):
+        for file_path in sorted(LEARNING_DATA_DIR.glob("*.txt")):
+
             try:
+
                 with open(file_path, "r", encoding="utf-8") as f:
+
                     content = f.read().strip()
 
                     if content:
+
                         documents.append(
                             Document(
                                 page_content=content,
@@ -64,61 +60,79 @@ class VectorStoreService:
                             )
                         )
 
+                        logger.info(
+                            "[VECTOR] Loaded learning data: %s (%d chars)",
+                            file_path.name,
+                            len(content),
+                        )
+
             except Exception as e:
+
                 logger.warning(
                     "Could not load learning data file %s: %s",
                     file_path,
                     e,
                 )
 
-        return documents
+        logger.info(
+            "[VECTOR] Total learning data files loaded: %d",
+            len(documents),
+        )
 
+        return documents
 
     def load_chat_history(self) -> List[Document]:
 
         documents = []
 
-        for file_path in list(CHATS_DATA_DIR.glob("*.json")):
+        for file_path in sorted(CHATS_DATA_DIR.glob("*.json")):
 
             try:
+
                 with open(file_path, "r", encoding="utf-8") as f:
 
                     chat_data = json.load(f)
 
-                    messages = chat_data.get("messages", [])
+                messages = chat_data.get("messages", [])
 
-                    chat_content = "\n".join(
-                        [
-                            f"User: {msg.get('content', '')}"
-                            if msg.get("role") == "user"
-                            else f"Assistant: {msg.get('content', '')}"
-                            for msg in messages
-                        ]
+                chat_content = "\n".join(
+                    [
+                        f"User: {msg.get('content', '')}"
+                        if msg.get("role") == "user"
+                        else f"Assistant: {msg.get('content', '')}"
+                        for msg in messages
+                    ]
+                )
+
+                if chat_content.strip():
+
+                    documents.append(
+                        Document(
+                            page_content=chat_content,
+                            metadata={"source": f"chat_{file_path.stem}"},
+                        )
                     )
 
-                    if chat_content.strip():
-                        documents.append(
-                            Document(
-                                page_content=chat_content,
-                                metadata={
-                                    "source": f"chat_{file_path.stem}"
-                                },
-                            )
-                        )
+                    logger.info(
+                        "[VECTOR] Loaded chat history: %s (%d messages)",
+                        file_path.name,
+                        len(messages),
+                    )
 
             except Exception as e:
+
                 logger.warning(
                     "Could not load chat history file %s: %s",
                     file_path,
                     e,
                 )
 
+        logger.info(
+            "[VECTOR] Total chat history files loaded: %d",
+            len(documents),
+        )
+
         return documents
-
-
-    # ---------------------------------------------------------
-    # BUILD AND SAVE FAISS INDEX
-    # ---------------------------------------------------------
 
     def create_vector_store(self) -> FAISS:
 
@@ -128,11 +142,22 @@ class VectorStoreService:
 
         all_documents = learning_docs + chat_docs
 
+        logger.info(
+            "[VECTOR] Total documents to index: %d (learning: %d, chat: %d)",
+            len(all_documents),
+            len(learning_docs),
+            len(chat_docs),
+        )
+
         if not all_documents:
 
             self.vector_store = FAISS.from_texts(
                 ["No data available yet."],
                 self.embeddings,
+            )
+
+            logger.info(
+                "[VECTOR] No documents found, created placeholder index"
             )
 
         else:
@@ -141,43 +166,88 @@ class VectorStoreService:
                 all_documents
             )
 
+            logger.info(
+                "[VECTOR] Split into %d chunks (chunk_size=%d, overlap=%d)",
+                len(chunks),
+                CHUNK_SIZE,
+                CHUNK_OVERLAP,
+            )
+
             self.vector_store = FAISS.from_documents(
                 chunks,
                 self.embeddings,
             )
 
+            logger.info(
+                "[VECTOR] FAISS index built successfully with %d vectors",
+                len(chunks),
+            )
+
+        self._retriever_cache.clear()
+
         self.save_vector_store()
 
         return self.vector_store
-
 
     def save_vector_store(self):
 
         if self.vector_store:
 
             try:
+
                 self.vector_store.save_local(
                     str(VECTOR_STORE_DIR)
                 )
 
             except Exception as e:
+
                 logger.error(
                     "Failed to save vector store to disk: %s",
                     e,
                 )
 
-
-    # ---------------------------------------------------------
-    # RETRIEVER
-    # ---------------------------------------------------------
-
-    def get_retriever(self, k: int = 10):
+    def get_retriever(
+        self,
+        k: int = 5,
+    ):
 
         if not self.vector_store:
-            raise RuntimeError(
-                "Vector store not initialized."
-            )
 
-        return self.vector_store.as_retriever(
+            if VECTOR_STORE_DIR.exists():
+
+                try:
+
+                    self.vector_store = FAISS.load_local(
+                        str(VECTOR_STORE_DIR),
+                        self.embeddings,
+                        allow_dangerous_deserialization=True,
+                    )
+
+                    logger.info(
+                        "[VECTOR] Loaded existing FAISS index from disk"
+                    )
+
+                except Exception as e:
+
+                    logger.warning(
+                        "[VECTOR] Failed to load index, rebuilding: %s",
+                        e,
+                    )
+
+                    self.create_vector_store()
+
+            else:
+
+                self.create_vector_store()
+
+        if k in self._retriever_cache:
+
+            return self._retriever_cache[k]
+
+        retriever = self.vector_store.as_retriever(
             search_kwargs={"k": k}
         )
+
+        self._retriever_cache[k] = retriever
+
+        return retriever

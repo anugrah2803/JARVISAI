@@ -1,0 +1,13 @@
+{
+  "session_id": "7f30c7d0-02fd-4f0a-bea1-b3f32b4dbd05",
+  "messages": [
+    {
+      "role": "user",
+      "content": "who is elon musk"
+    },
+    {
+      "role": "assistant",
+      "content": "Elon Musk is a entrepreneur and business magnate, best known for founding companies like SpaceX, Tesla, and PayPal, Anugrah Dubey."
+    }
+  ]
+}

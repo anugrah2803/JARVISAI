@@ -1,22 +1,9 @@
-"""
-RETRY UTILITY
-=============
-
-Calls a function and, if it raises, retries a few times with exponential backoff.
-Used for Groq and Tavily API calls so temporary rate limits or network blips
-don't immediately fail the request.
-
-Example:
-    response = with_retry(lambda: groq_client.chat(...), max_retries=3, initial_delay=1.0)
-"""
-
 import logging
 import time
 from typing import TypeVar, Callable
 
 
 logger = logging.getLogger("J.A.R.V.I.S")
-
 
 T = TypeVar("T")
 
@@ -26,10 +13,6 @@ def with_retry(
     max_retries: int = 3,
     initial_delay: float = 1.0,
 ) -> T:
-    """
-    Execute fn(). If it raises, wait initial_delay seconds and try again; delay doubles each retry.
-    After max_retries attempts (including the first), re-raise the last exception.
-    """
 
     last_exception = None
     delay = initial_delay
@@ -56,7 +39,6 @@ def with_retry(
             )
 
             time.sleep(delay)
-
             delay *= 2
 
     raise last_exception

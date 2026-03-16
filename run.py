@@ -34,5 +34,6 @@ if __name__ == "__main__":
         "app.main:app",   # String path to the FastAPI app instance (module:variable)
         host="0.0.0.0",   # Listen on all network interfaces so other devices can connect
         port=8000,        # HTTP port; change if 8000 is already in use
-        reload=True       # Auto-restart when .py files change (useful during development)
+        reload=False,
+        log_level="info"       # Auto-restart when .py files change (useful during development)
     )

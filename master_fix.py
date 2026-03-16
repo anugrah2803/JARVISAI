@@ -1,4 +1,26 @@
 import json
+
+# ============================================================
+# FIX 1: main.py - "text" key ko "chunk" se replace karo
+# FIX 2: main.py - [DONE] ko proper done event se replace karo
+# FIX 3: chat_service.py - sahi methods aur class name fix
+# ============================================================
+
+# --- Fix main.py ---
+with open("app/main.py", "r", encoding="utf-8") as f:
+    main_content = f.read()
+
+main_content = main_content.replace('"text": s,', '"chunk": s,')
+main_content = main_content.replace('"text": buffer.strip(),', '"chunk": buffer.strip(),')
+main_content = main_content.replace('yield "data: [DONE]\\n\\n"', 'yield "data: " + json.dumps({"chunk": "", "done": True}) + "\\n\\n"')
+
+with open("app/main.py", "w", encoding="utf-8") as f:
+    f.write(main_content)
+
+print("main.py fixed")
+
+# --- Fix chat_service.py - rewrite completely ---
+chat_service_content = '''import json
 import logging
 from pathlib import Path
 from typing import List, Optional, Dict
@@ -115,3 +137,10 @@ class ChatService:
                 json.dump(chat_dist, f, indent=2, ensure_ascii=False)
         except Exception as e:
             logger.warning("Failed to save chat session %s to disk: %s", session_id, e)
+'''
+
+with open("app/services/chat_service.py", "w", encoding="utf-8") as f:
+    f.write(chat_service_content)
+
+print("chat_service.py fixed")
+print("All fixes applied successfully!")

@@ -21,12 +21,6 @@ COMMANDS:
     /history - View chat history for current session
     /clear - Start a new session (clears current session)
     /quit or /exit - Exit the test interface
-HOW IT WORKS:
-1. User selects a mode (1 for general, 2 for realtime)
-2. User types messages which are sent to the appropriate endpoint
-3. Both modes use the same session_id, so conversation context is shared
-4. User can switch modes at any time within the same conversation
-5. Session persists until user clears it or starts a new one
 """
 
 import requests
@@ -43,11 +37,9 @@ except ImportError:
 # -----------------------------------------------------------------------------
 # CONFIGURATION
 # -----------------------------------------------------------------------------
-# API base URL; change if your server runs on a different host or port.
 BASE_URL = "http://localhost:8000"
-# Single session for this test client; shared between general and realtime modes.
 SESSION_ID = None
-CURRENT_MODE = None  # "general" (pure LLM) or "realtime" (with Tavily search)
+CURRENT_MODE = None  # "general" or "realtime"
 
 
 # -----------------------------------------------------------------------------
@@ -72,6 +64,8 @@ def get_user_input():
     """Get user's input - either mode selection or message."""
     try:
         choice = input("\nYou: ").strip()
+        if not choice:  # empty input — ignore karo
+            return ""
         return choice
     except (KeyboardInterrupt, EOFError):
         return None
@@ -82,55 +76,28 @@ def get_user_input():
 # -----------------------------------------------------------------------------
 
 def send_message(message, mode):
-    """
-    Send a message to the appropriate JARVIS endpoint.
-    
-    This function sends the user's message to either the general chat endpoint
-    (/chat) or the realtime chat endpoint (/chat/realtime) based on the selected mode.
-    It uses the same session_id for both modes, allowing conversation continuity.
-    
-    Args:
-        message: The user's message/question
-        mode: Either "general" or "realtime" to determine which endpoint to use
-    
-    Returns:
-        str: JARVIS's response, or an error message if something went wrong
-    
-    Note:
-        - Creates a new session_id if one doesn't exist
-        - Uses longer timeout for realtime mode (60s) since it includes web search
-        - General mode uses shorter timeout (30s) as it's faster
-    """
     global SESSION_ID
     
-    # Generate a new session ID if we don't have one yet
-    # This session_id will be used for both general and realtime modes
     if not SESSION_ID:
         SESSION_ID = str(uuid4())
     
-    # Choose endpoint based on mode
-    # /chat/realtime uses Tavily search, /chat is general chat
     endpoint = "/chat/realtime" if mode == "realtime" else "/chat"
     
     try:
-        # Send POST request to the appropriate endpoint
-        # Include the message and session_id in the request body
         response = requests.post(
             f"{BASE_URL}{endpoint}",
             json={
                 "message": message,
                 "session_id": SESSION_ID
             },
-            timeout=60 if mode == "realtime" else 30  # Realtime needs more time for web search
+            timeout=60 if mode == "realtime" else 30
         )
         
-        # If request succeeded, extract response and update session_id
         if response.status_code == 200:
             data = response.json()
-            SESSION_ID = data.get("session_id", SESSION_ID)  # Update session_id if server returned one
+            SESSION_ID = data.get("session_id", SESSION_ID)
             return data.get("response", "No response")
         else:
-            # Request failed - show user-friendly message when available (e.g. 429 rate limit)
             try:
                 err = response.json()
                 if isinstance(err.get("detail"), str):
@@ -140,37 +107,18 @@ def send_message(message, mode):
             return f"❌ Error: {response.status_code} - {response.text}"
     
     except requests.exceptions.ConnectionError:
-        # Server is not running or not accessible
         return "❌ Cannot connect to backend. Start it with: python run.py"
     except requests.exceptions.Timeout:
-        # Request took too long (especially for realtime mode)
         return "❌ Request timed out. Try a simpler query."
     except Exception as e:
-        # Any other error
         return f"❌ Error: {str(e)}"
 
 
 def get_chat_history():
-    """
-    Retrieve and format chat history for the current session.
-    
-    This function fetches all messages from the current session and formats them
-    in a readable way. The history includes both general and realtime messages
-    since they share the same session_id.
-    
-    Returns:
-        str: Formatted chat history, or an error message if retrieval failed
-    
-    Note:
-        - Returns "No active session" if no session_id exists
-        - Shows all messages from both general and realtime modes
-        - Messages are numbered and clearly labeled as "You" or "Jarvis"
-    """
     if not SESSION_ID:
         return "No active session"
     
     try:
-        # Request chat history from the API
         response = requests.get(
             f"{BASE_URL}/chat/history/{SESSION_ID}",
             timeout=10
@@ -183,11 +131,9 @@ def get_chat_history():
             if not messages:
                 return "No messages in this session"
             
-            # Format the history for display
             output = f"\n📜 Chat History ({len(messages)} messages):\n"
             output += "-" * 60 + "\n"
             
-            # Display each message with its role (user or assistant)
             for i, msg in enumerate(messages, 1):
                 role = "You" if msg.get("role") == "user" else ASSISTANT_NAME
                 content = msg.get("content", "")
@@ -207,10 +153,6 @@ def get_chat_history():
 # -----------------------------------------------------------------------------
 
 def main():
-    """
-    Main chat loop: prompt for mode (1=general, 2=realtime), then accept messages
-    until /quit or /exit. Handles /history, /clear, and mode switching.
-    """
     print_header()
     
     global SESSION_ID, CURRENT_MODE
@@ -222,10 +164,17 @@ def main():
     while True:
         try:
             user_input = get_user_input()
+
+            # None means Ctrl+C or EOF
             if user_input is None:
                 print("\n👋 Goodbye!")
                 break
-            # Mode selection (1 = general chat, 2 = realtime with search)
+
+            # Empty input — just loop again
+            if user_input == "":
+                continue
+
+            # Mode selection
             if user_input == "1":
                 CURRENT_MODE = "general"
                 print("✅ Switched to GENERAL chat (pure LLM, no web search)\n")
@@ -236,7 +185,7 @@ def main():
                 print("✅ Switched to REALTIME chat (with Tavily web search)\n")
                 continue
             
-            # Slash commands: history, clear session, or quit
+            # Slash commands
             elif user_input == "/history":
                 print(get_chat_history())
                 continue
@@ -255,6 +204,7 @@ def main():
             elif user_input.startswith("/"):
                 print(f"❌ Unknown command: {user_input}")
                 continue
+
             # Must have chosen a mode before sending a message
             if not CURRENT_MODE:
                 print("❌ Please select a mode first (1=General or 2=Realtime)")
@@ -273,6 +223,5 @@ def main():
             print(f"❌ Error: {str(e)}")
 
 
-# Run the interactive loop when this file is executed (python test.py).
 if __name__ == "__main__":
     main()

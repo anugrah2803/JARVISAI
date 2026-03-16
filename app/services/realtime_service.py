@@ -1,175 +1,389 @@
-from typing import List, Optional
+from typing import List, Optional, Iterator, Tuple, Any
 from tavily import TavilyClient
 import logging
 import os
+import time
 
-from app.services.groq_service import GroqService, escape_curly_braces
+from app.services.groq_service import GroqService, escape_curly_braces, AllGroqApisFailedError
 from app.services.vector_store import VectorStoreService
-from app.utils.time_info import get_time_information
 from app.utils.retry import with_retry
-from config import JARVIS_SYSTEM_PROMPT
-from langchain_groq import ChatGroq
-from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
-from langchain_core.messages import HumanMessage, AIMessage
-
-from config import GROQ_API_KEY, GROQ_MODEL, JARVIS_SYSTEM_PROMPT
+from config import REALTIME_CHAT_ADDENDUM, GROQ_API_KEYS, GROQ_MODEL
 
 
 logger = logging.getLogger("J.A.R.V.I.S")
 
 
-class RealTimeGroqService(GroqService):
+GROQ_REQUEST_TIMEOUT_FAST = 15
+
+
+QUERY_EXTRACTION_PROMPT = (
+    "You are a search query optimizer. Given the user's message and recent conversation, "
+    "produce a single short, focused web search query (max 12 words) that will find the "
+    "information the user needs. Resolve any references (like 'that website', 'him', 'it') "
+    "using the conversation history. Output ONLY the search query, nothing else."
+)
+
+
+class RealtimeGroqService(GroqService):
 
     def __init__(self, vector_store_service: VectorStoreService):
+
         super().__init__(vector_store_service)
 
-        Tavily_api_key = os.getenv("TAVILY_API_KEY", "")
+        tavily_api_key = os.getenv("TAVILY_API_KEY", "")
 
-        if Tavily_api_key:
-            self.tavily_client = TavilyClient(api_key=Tavily_api_key)
-            logger.info("Tavily client initialized successfully.")
+        if tavily_api_key:
+            self.tavily_client = TavilyClient(api_key=tavily_api_key)
+            logger.info("Tavily search client initialized successfully")
         else:
             self.tavily_client = None
-            logger.warning("Tavily API key not found.")
+            logger.warning("TAVILY_API_KEY not set. Realtime search will be unavailable.")
 
-    def search_tavily(self, query: str, num_results: int = 5) -> str:
+        if GROQ_API_KEYS:
 
-        if not self.tavily_client:
-            logger.error("Tavily client is not initialized.")
-            return ""
+            from langchain_groq import ChatGroq
 
-        formatted_result = ""
-
-        try:
-            response = with_retry(
-                lambda: self.tavily_client.search(
-                    query=query,
-                    search_depth="basic",
-                    max_results=num_results,
-                    include_answers=False,
-                    include_raw_content=False,
-                ),
-                max_retries=3,
-                initial_delay=1.0,
+            self._fast_llm = ChatGroq(
+                groq_api_key=GROQ_API_KEYS[0],
+                model_name=GROQ_MODEL,
+                temperature=0.0,
+                request_timeout=GROQ_REQUEST_TIMEOUT_FAST,
+                max_tokens=50,
             )
 
-            results = response.get("results", [])
+        else:
+            self._fast_llm = None
+    
+def _extract_search_query(
+    self,
+    question: str,
+    chat_history: Optional[List[tuple]] = None,
+) -> str:
+
+    if not self._fast_llm:
+        return question
+
+    try:
+
+        t0 = time.perf_counter()
+
+        history_context = ""
+
+        if chat_history:
+
+            recent = chat_history[-3:]
+
+            parts = []
+
+            for h, a in recent:
+                parts.append(f"User: {h[:200]}")
+                parts.append(f"Assistant: {a[:200]}")
+
+            history_context = "\n".join(parts)
+
+        if history_context:
+
+            full_prompt = (
+                f"{QUERY_EXTRACTION_PROMPT}\n\n"
+                f"Recent conversation:\n{history_context}\n\n"
+                f"User's latest message: {question}\n\n"
+                f"Search query:"
+            )
+
+        else:
+
+            full_prompt = (
+                f"{QUERY_EXTRACTION_PROMPT}\n\n"
+                f"User's message: {question}\n\n"
+                f"Search query:"
+            )
+
+        response = self._fast_llm.invoke(full_prompt)
+
+        extracted = response.content.strip().strip('"').strip("'")
+
+        if extracted and 3 <= len(extracted) <= 200:
+
+            logger.info(
+                "[REALTIME] Query extraction: '%s' -> '%s' (%.3fs)",
+                question[:80],
+                extracted[:80],
+                time.perf_counter() - t0,
+            )
+
+            return extracted
+
+        logger.warning(
+            "[REALTIME] Query extraction returned unusable result, using raw question"
+        )
+
+        return question
+
+    except Exception as e:
+
+        logger.warning(
+            "[REALTIME] Query extraction failed (%s), using raw question",
+            e,
+        )
+
+        return question
+    
+def search_tavily(
+    self,
+    query: str,
+    num_results: int = 7,
+) -> Tuple[str, Optional[dict]]:
+
+    if not self.tavily_client:
+        logger.warning("Tavily client not initialized. TAVILY_API_KEY not set.")
+        return "", None
+
+    try:
+
+        t0 = time.perf_counter()
+
+        response = with_retry(
+            lambda: self.tavily_client.search(
+                query=query,
+                search_depth="advanced",
+                max_results=num_results,
+                include_answer=True,
+                include_raw_content=False,
+            ),
+            max_retries=3,
+            initial_delay=1.0,
+        )
+
+        results = response.get("results", [])
+        ai_answer = response.get("answer", "")
+
+        if not results and not ai_answer:
+            logger.warning(
+                "No Tavily search results for query: %s",
+                query,
+            )
+            return "", None
+
+        payload: Optional[dict] = {
+            "query": query,
+            "answer": ai_answer,
+            "results": [
+                {
+                    "title": r.get("title", "No title"),
+                    "content": (r.get("content", "") or "")[:500],
+                    "url": r.get("url", ""),
+                    "score": round(float(r.get("score", 0)), 2),
+                }
+                for r in results[:num_results]
+            ],
+        }
+
+        parts = [f"=== WEB SEARCH RESULTS FOR: {query} ===\n"]
+
+        if ai_answer:
+            parts.append(
+                f"AI-SYNTHESIZED ANSWER (use this as your primary source):\n{ai_answer}\n"
+            )
+
+        if results:
+
+            parts.append("INDIVIDUAL SOURCES:\n")
 
             for i, result in enumerate(results[:num_results], 1):
 
-                title = result.get("title", "No Title")
-                content = result.get("content", "No Content")
+                title = result.get("title", "No title")
+                content = result.get("content", "")
                 url = result.get("url", "")
+                score = result.get("score", 0)
 
-                formatted_result += f"title: {title}\n"
-                formatted_result += f"description: {content}\n"
+                parts.append(
+                    f"[Source {i}] (relevance: {score:.2f})"
+                )
+
+                parts.append(f"Title: {title}")
+
+                if content:
+                    parts.append(f"Content: {content}")
 
                 if url:
-                    formatted_result += f"url: {url}\n"
+                    parts.append(f"URL: {url}")
 
-                formatted_result += "\n"
+                parts.append("")
 
+        parts.append("=== END SEARCH RESULTS ===")
+
+        formatted = "\n".join(parts)
+
+        logger.info(
+            "[TAVILY] %d results, AI answer: %s, formatted: %d chars (%.3fs)",
+            len(results),
+            "yes" if ai_answer else "no",
+            len(formatted),
+            time.perf_counter() - t0,
+        )
+
+        return formatted, payload
+
+    except Exception as e:
+
+        logger.error(
+            "Error performing Tavily search: %s",
+            e,
+        )
+
+        return "", None
+
+def get_response(
+    self,
+    question: str,
+    chat_history: Optional[List[tuple]] = None,
+) -> str:
+
+    try:
+
+        search_query = self._extract_search_query(
+            question,
+            chat_history,
+        )
+
+        logger.info(
+            "[REALTIME] Searching Tavily for: %s",
+            search_query,
+        )
+
+        formatted_results, payload = self.search_tavily(
+            search_query,
+            num_results=7,
+        )
+
+        if formatted_results:
             logger.info(
-                f"Tavily search completed for query: {query} ({len(results)} results)"
+                "[REALTIME] Tavily returned results (length: %d chars)",
+                len(formatted_results),
+            )
+        else:
+            logger.warning(
+                "[REALTIME] Tavily returned no results for: %s",
+                search_query,
             )
 
-            return formatted_result
+        extra_parts = (
+            [escape_curly_braces(formatted_results)]
+            if formatted_results
+            else None
+        )
 
-        except Exception as e:
-            logger.error(f"Error during Tavily search: {e}")
-            return ""
+        prompt, messages = self._build_prompt_and_messages(
+            question,
+            chat_history,
+            extra_system_parts=extra_parts,
+            mode_addendum=REALTIME_CHAT_ADDENDUM,
+        )
 
-    def get_response(
-        self,
-        question: str,
-        chat_history: Optional[List[tuple]] = None,
-    ) -> str:
+        t0 = time.perf_counter()
 
-        try:
+        response_content = self._invoke_llm(
+            prompt,
+            messages,
+            question,
+        )
 
-            logger.info(f"Generating response for question: {question}")
+        logger.info(
+            "[TIMING] groq api: %.3fs",
+            time.perf_counter() - t0,
+        )
 
-            search_results = self.search_tavily(question, num_results=5)
+        logger.info(
+            "[RESPONSE] Realtime chat | Length: %d chars | Preview: %.120s",
+            len(response_content),
+            response_content,
+        )
 
-            context = ""
-            context_docs = []
+        return response_content
 
-            try:
-                retriever = self.vector_store_service.get_retriever(k=10)
-                context_docs = retriever.invoke(question)
+    except AllGroqApisFailedError:
+        raise
 
-                context = (
-                    "\n".join(
-                        [doc.page_content for doc in context_docs]
-                    )
-                    if context_docs
-                    else ""
-                )
+    except Exception as e:
 
-            except Exception as retrieve_err:
-                logger.warning(
-                    f"Error retrieving context from vector store: {retrieve_err}"
-                )
+        logger.error(
+            "Error in realtime get_response: %s",
+            e,
+            exc_info=True,
+        )
 
-            time_info = get_time_information()
+        raise
 
-            system_message = (
-                JARVIS_SYSTEM_PROMPT
-                + f"\nCurrent time and date: {time_info}"
-            )
+def stream_response(
+    self,
+    question: str,
+    chat_history: Optional[List[tuple]] = None,
+) -> Iterator[Any]:
 
-            if search_results:
-                escaped_search_results = escape_curly_braces(
-                    search_results
-                )
+    try:
 
-                system_message += (
-                    f"\n\nRelevant information from the web:\n"
-                    f"{escaped_search_results}"
-                )
+        search_query = self._extract_search_query(
+            question,
+            chat_history,
+        )
 
-            if context:
-                escaped_context = escape_curly_braces(context)
+        logger.info(
+            "[REALTIME] Searching Tavily for: %s",
+            search_query,
+        )
 
-                system_message += (
-                    f"\n\nRelevant information from the vector store:\n"
-                    f"{escaped_context}"
-                )
+        formatted_results, payload = self.search_tavily(
+            search_query,
+            num_results=7,
+        )
 
-            prompt = ChatPromptTemplate.from_messages(
-                [
-                    ("system", system_message),
-                    MessagesPlaceholder(variable_name="history"),
-                    ("human", "{question}"),
-                ]
-            )
-
-            messages = []
-
-            if chat_history:
-                for human_msg, ai_msg in chat_history:
-                    messages.append(
-                        HumanMessage(content=human_msg)
-                    )
-                    messages.append(
-                        AIMessage(content=ai_msg)
-                    )
-
-            response_content = self._invoke_llm(
-                prompt,
-                messages,
-                question,
-            )
-
+        if formatted_results:
             logger.info(
-                f"RealTime Response generated successfully for question: {question}"
+                "[REALTIME] Tavily returned results (length: %d chars)",
+                len(formatted_results),
+            )
+        else:
+            logger.warning(
+                "[REALTIME] Tavily returned no results for: %s",
+                search_query,
             )
 
-            return response_content
+        if payload:
+            yield {"_search_results": payload}
 
-        except Exception as e:
-            logger.error(
-                f"Error generating response: {e}",
-                exc_info=True,
-            )
-            raise
+        extra_parts = (
+            [escape_curly_braces(formatted_results)]
+            if formatted_results
+            else None
+        )
+
+        prompt, messages = self._build_prompt_and_messages(
+            question,
+            chat_history,
+            extra_system_parts=extra_parts,
+            mode_addendum=REALTIME_CHAT_ADDENDUM,
+        )
+
+        yield from self._stream_llm(
+            prompt,
+            messages,
+            question,
+        )
+
+        logger.info(
+            "[REALTIME] Stream completed for: %s",
+            search_query,
+        )
+
+    except AllGroqApisFailedError:
+        raise
+
+    except Exception as e:
+
+        logger.error(
+            "Error in realtime stream_response: %s",
+            e,
+            exc_info=True,
+        )
+
+        raise
